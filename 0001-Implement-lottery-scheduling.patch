@@ -1,0 +1,198 @@
+From fd1b0264e5981eb90c443d55bd03a8091d892ee9 Mon Sep 17 00:00:00 2001
+From: Hao Qin <hq411@nyu.edu>
+Date: Thu, 21 Nov 2019 20:15:29 -0500
+Subject: [PATCH] Implement lottery scheduling
+
+---
+ Makefile  |  1 +
+ proc.c    | 26 ++++++++++++++++++++++++--
+ proc.h    |  1 +
+ syscall.c |  2 ++
+ syscall.h |  1 +
+ sysproc.c |  9 +++++++++
+ user.h    |  3 ++-
+ usys.S    |  2 +-
+ 8 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 5d91068..7d17a81 100644
+--- a/Makefile
++++ b/Makefile
+@@ -174,6 +174,7 @@ UPROGS=\
+ 	_wc\
+ 	_zombie\
+ 	_hackbench\
++	_lotterytest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/proc.c b/proc.c
+index b122e3b..151a91c 100644
+--- a/proc.c
++++ b/proc.c
+@@ -48,6 +48,7 @@ allocproc(void)
+   return 0;
+ 
+ found:
++  p->num_tickets = 20;
+   p->state = EMBRYO;
+   p->pid = nextpid++;
+   release(&ptable.lock);
+@@ -265,25 +266,45 @@ wait(void)
+ //  - swtch to start running that process
+ //  - eventually that process transfers control
+ //      via swtch back to the scheduler.
++int sum_lottery_tickets(void){
++  struct proc *p;
++  int sum_all_processes_tickets = 0;
++  for (p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if (p->state != RUNNABLE){continue;}
++    sum_all_processes_tickets = sum_all_processes_tickets + p->num_tickets;
++  }
++  return sum_all_processes_tickets;
++}
++
+ void
+ scheduler(void)
+ {
+   struct proc *p;
+   int foundproc = 1;
++  int counter;
++  int sum_all_processes_tickets;
++  int winner = 0;
+ 
+   for(;;){
+     // Enable interrupts on this processor.
+     sti();
++    counter = 0;
++    sum_all_processes_tickets = sum_lottery_tickets();
+ 
+     if (!foundproc) hlt();
+     foundproc = 0;
+-
++    
++    winner = random_at_most(sum_all_processes_tickets);
+     // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->state != RUNNABLE)
+         continue;
+-
++      if (counter + p->num_tickets < winner){
++        counter = counter + p->num_tickets;
++        continue;
++      }	
++ 
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
+@@ -297,6 +318,7 @@ scheduler(void)
+       // Process is done running for now.
+       // It should have changed its p->state before coming back.
+       proc = 0;
++      break;
+     }
+     release(&ptable.lock);
+ 
+diff --git a/proc.h b/proc.h
+index 3b9c3ac..7277693 100644
+--- a/proc.h
++++ b/proc.h
+@@ -53,6 +53,7 @@ enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
+ // Per-process state
+ struct proc {
++  int num_tickets;             // num of tickets of lottery scheduling
+   uint sz;                     // Size of process memory (bytes)
+   pde_t* pgdir;                // Page table
+   char *kstack;                // Bottom of kernel stack for this process
+diff --git a/syscall.c b/syscall.c
+index 0e06ad4..4d2569b 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -77,6 +77,7 @@ argstr(int n, char **pp)
+   return fetchstr(addr, pp);
+ }
+ 
++extern int sys_settickets(void);
+ extern int sys_chdir(void);
+ extern int sys_close(void);
+ extern int sys_dup(void);
+@@ -101,6 +102,7 @@ extern int sys_uptime(void);
+ extern int sys_gettime(void);
+ 
+ static int (*syscalls[])(void) = {
++[SYS_settickets]    sys_settickets,
+ [SYS_fork]    sys_fork,
+ [SYS_exit]    sys_exit,
+ [SYS_wait]    sys_wait,
+diff --git a/syscall.h b/syscall.h
+index 6d6c224..e59bc4a 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -21,3 +21,4 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_gettime 22
++#define SYS_settickets 23
+diff --git a/sysproc.c b/sysproc.c
+index ddaed7c..eb5a198 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -43,6 +43,15 @@ sys_getpid(void)
+ }
+ 
+ int
++sys_settickets(void){
++  int n;
++  if (argint(0, &n) < 0)
++    return -1;
++  proc->num_tickets = n;
++  return n;
++}
++
++int
+ sys_sbrk(void)
+ {
+   int addr;
+diff --git a/user.h b/user.h
+index 46d1059..a1d4ca2 100644
+--- a/user.h
++++ b/user.h
+@@ -2,6 +2,7 @@ struct stat;
+ struct rtcdate;
+ 
+ // system calls
++
+ int fork(void);
+ int exit(void) __attribute__((noreturn));
+ int wait(void);
+@@ -24,7 +25,7 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ int gettime(struct rtcdate *);
+-
++int settickets(int);
+ // ulib.c
+ int stat(char*, struct stat*);
+ char* strcpy(char*, char*);
+diff --git a/usys.S b/usys.S
+index e556d66..76f9b33 100644
+--- a/usys.S
++++ b/usys.S
+@@ -7,7 +7,6 @@
+     movl $SYS_ ## name, %eax; \
+     int $T_SYSCALL; \
+     ret
+-
+ SYSCALL(fork)
+ SYSCALL(exit)
+ SYSCALL(wait)
+@@ -30,3 +29,4 @@ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
+ SYSCALL(gettime)
++SYSCALL(settickets)
+-- 
+1.9.1
+
